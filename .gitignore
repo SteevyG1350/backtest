@@ -1,0 +1,42 @@
+# Dependencies
+/node_modules
+/backend/node_modules
+/trading_system/venv
+
+# Logs
+*.log
+
+# Backtest results
+/backend/backtest_results
+
+# Uploads
+/backend/uploads
+/uploads
+
+# Python cache
+__pycache__/
+
+# Lock files
+.~lock.*
+
+# Data
+/trading_system/data/*.csv
+
+# Temp files
+colab_notebook.txt
+pine_script_strategy.pine
+
+# Frontend
+/frontend/node_modules
+/frontend/.pnp
+/frontend/.pnp.js
+/frontend/coverage
+/frontend/build
+/frontend/.DS_Store
+/frontend/.env.local
+/frontend/.env.development.local
+/frontend/.env.test.local
+/frontend/.env.production.local
+/frontend/npm-debug.log*
+/frontend/yarn-debug.log*
+/frontend/yarn-error.log*

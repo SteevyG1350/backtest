@@ -1,0 +1,207 @@
+// @version=6
+// Adaptive XAU / GBPJPY Scalper - Fixed & Updated (v6) — ADX & day detection fixes
+// Changes in this revision:
+// - Removed dependency on ta.adx (some Pine runtimes lack it) and replaced ADX-based regime with SMA-slope + BB-width logic
+// - Replaced dayofyear usage with a robust daily check using time('D')
+// - Cleaned request.security calls to avoid referencing externally-defined series inside them
+
+//@version=6
+strategy("Adaptive XAU / GBPJPY Scalper - Improved (v6)", overlay=true, margin_long=100, margin_short=100, default_qty_type=strategy.fixed, default_qty_value=1, initial_capital=10000, currency=currency.USD)
+
+// =========================
+// === USER INPUTS ========
+// =========================
+// Timeframes
+regime_tf = input.timeframe(title="Regime TF for trend confirmation", defval="60")
+
+// Risk parameters
+risk_pct = input.float(title="Risk per trade (%)", defval=1.0, step=0.1) / 100.0
+atr_len = input.int(title="ATR Length", defval=14)
+atr_mult_sl = input.float(title="SL ATR Multiplier (k)", defval=2.0)
+atr_mult_trail = input.float(title="Trailing ATR Multiplier (n)", defval=1.0)
+rr_target = input.float(title="Default R:R target (m)", defval=2.5)
+
+// Execution assumptions
+unit_value = input.float(title="Unit value (account currency per 1.0 price move per contract)", defval=1.0, step=0.01)
+
+// Indicators
+vol_ma = input.int(title="Volume MA Length", defval=20)
+vol_mult = input.float(title="Volume spike multiplier", defval=1.5)
+
+// Toggles
+allow_long = input.bool(true, title="Allow Longs")
+allow_short = input.bool(true, title="Allow Shorts")
+partial_exit = input.bool(true, title="Use Partial Exit (50%)")
+partial_exit_pct = input.float(title="Partial exit percent", defval=50.0, minval=0.0, maxval=100.0) / 100.0
+
+// Execution settings
+max_open_trades = input.int(title="Max Open Trades per Instrument", defval=1, minval=1)
+
+// Safety toggles
+daily_stop_pct = input.float(title="Daily stop loss (% of equity) - stop trading for day", defval=3.0) / 100.0
+
+// =========================
+// == HELPERS =============
+// =========================
+f_atr(len) => ta.atr(len)
+
+f_vol_spike(vol, ma_len, mult) => vol > ta.sma(vol, ma_len) * mult
+
+f_bull_engulf() =>
+bull = close > open and close[1] < open[1] and close > open[1] and open < close[1]
+bull
+
+f_bear_engulf() =>
+bear = close < open and close[1] > open[1] and close < open[1] and open > close[1]
+bear
+
+f_hammer() =>
+body = math.abs(close - open)
+lower = math.min(open, close) - low
+upper = high - math.max(open, close)
+is_hammer = (lower > body * 2) and (upper <= body)
+is_hammer
+
+// =========================
+// == REGIME MODULE =======
+// =========================
+// Simpler, compatible regime detection without ADX: use higher-TF SMA slope + BB width (volatility)
+reg_sma50 = request.security(syminfo.tickerid, regime_tf, ta.sma(close, 50))
+reg_sma50_prev = request.security(syminfo.tickerid, regime_tf, ta.sma(close, 50)[1])
+// BB width in higher TF simplifies to 4 * stdev(close,20)
+reg_bb_width = request.security(syminfo.tickerid, regime_tf, 4 * ta.stdev(close, 20))
+reg_bb_width_sma = request.security(syminfo.tickerid, regime_tf, ta.sma(4 * ta.stdev(close, 20), 50))
+
+var string regime = "UNKNOWN"
+if reg_sma50 > reg_sma50_prev
+regime := "TREND_UP"
+else if reg_sma50 < reg_sma50_prev
+regime := "TREND_DOWN"
+else
+regime := reg_bb_width > reg_bb_width_sma ? "RANGE_HIGH_VOL" : "RANGE_LOW_VOL"
+
+// Draw regime on last bar
+var label reg_label = na
+if barstate.islast
+label.delete(reg_label)
+reg_label := label.new(bar_index, high, text="Regime: " + regime, style=label.style_label_left, color=color.new(color.gray, 85), textcolor=color.white)
+
+// =========================
+// == SIGNALS MODULE ======
+// =========================
+atr = f_atr(atr_len)
+rsi = ta.rsi(close, 14)
+vol = volume
+vol_ma_val = ta.sma(vol, vol_ma)
+
+// Entry patterns
+long_candle_signal = f_bull_engulf() or f_hammer()
+short_candle_signal = f_bear_engulf() or f_hammer()
+vol_confirm_long = f_vol_spike(vol, vol_ma, vol_mult)
+vol_confirm_short = f_vol_spike(vol, vol_ma, vol_mult)
+
+// Directional filter: MA slope on chart TF
+ma_fast = ta.sma(close, 20)
+ma_slow = ta.sma(close, 50)
+ma_slope_up = ma_fast > ma_slow
+ma_slope_down = ma_fast < ma_slow
+
+// =========================
+// == DAILY STOP / ENABLE ==
+// =========================
+// Robust new-day detection using time('D')
+new_day = time("D") != time("D")[1]
+var float starting_equity_today = na
+if new_day
+starting_equity_today := strategy.equity
+
+var bool trading_enabled = true
+if not na(starting_equity_today)
+if (starting_equity_today - strategy.equity) / starting_equity_today >= daily_stop_pct
+trading_enabled := false
+
+// Composite entries (respecting trading_enabled and regime)
+can_long = allow_long and trading_enabled and long_candle_signal and vol_confirm_long and regime != "TREND_DOWN" and ma_slope_up
+can_short = allow_short and trading_enabled and short_candle_signal and vol_confirm_short and regime != "TREND_UP" and ma_slope_down
+
+// =========================
+// == RISK & SIZING ========
+// =========================
+sl_dist = atr * atr_mult_sl
+initial_tp_dist = sl_dist * rr_target
+
+calc_qty(equity, risk, sl_price_distance, unit_val) =>
+max_risk_amount = equity * risk
+qty = sl_price_distance > 0 ? math.floor(max_risk_amount / (sl_price_distance * unit_val)) : 0
+qty
+
+// =========================
+// == ORDER EXECUTION ======
+// =========================
+var float entry_price = na
+var float highest_since_entry = na
+var float lowest_since_entry = na
+var int entry_side = 0 // 1 = long, -1 = short
+
+pos_size = strategy.position_size
+
+// Entry rules
+if can_long and pos_size == 0 and strategy.opentrades < max_open_trades
+qty = calc_qty(strategy.equity, risk_pct, sl_dist, unit_value)
+if qty > 0
+strategy.order(id="LongEntry", direction=strategy.long, qty=qty, comment="LongEntry")
+
+if can_short and pos_size == 0 and strategy.opentrades < max_open_trades
+qtys = calc_qty(strategy.equity, risk_pct, sl_dist, unit_value)
+if qtys > 0
+strategy.order(id="ShortEntry", direction=strategy.short, qty=qtys, comment="ShortEntry")
+
+// Capture entry when position opens
+if pos_size != 0 and entry_side == 0
+entry_price := strategy.position_avg_price
+highest_since_entry := entry_price
+lowest_since_entry := entry_price
+entry_side := pos_size > 0 ? 1 : -1
+
+// Manage open long
+if entry_side == 1 and not na(highest_since_entry)
+highest_since_entry := math.max(highest_since_entry, high)
+trail_stop_price = highest_since_entry - atr * atr_mult_trail
+hard_stop = entry_price - sl_dist
+new_stop = math.max(hard_stop, trail_stop_price)
+if partial_exit
+partial_tp_price = entry_price + initial_tp_dist * 0.5
+strategy.exit(id="PartialLongExit", from_entry="LongEntry", qty_percent=partial_exit_pct * 100, limit=partial_tp_price, comment="PartialTP")
+strategy.exit(id="FullLongExit", from_entry="LongEntry", stop=new_stop, limit=entry_price + initial_tp_dist, comment="FullTP_Exit")
+
+// Manage open short
+if entry_side == -1 and not na(lowest_since_entry)
+lowest_since_entry := math.min(lowest_since_entry, low)
+trail_stop_price_s = lowest_since_entry + atr * atr_mult_trail
+hard_stop_s = entry_price + sl_dist
+new_stop_s = math.min(hard_stop_s, trail_stop_price_s)
+if partial_exit
+partial_tp_price_s = entry_price - initial_tp_dist * 0.5
+strategy.exit(id="PartialShortExit", from_entry="ShortEntry", qty_percent=partial_exit_pct * 100, limit=partial_tp_price_s, comment="PartialTPShort")
+strategy.exit(id="FullShortExit", from_entry="ShortEntry", stop=new_stop_s, limit=entry_price - initial_tp_dist, comment="FullTP_Exit_S")
+
+// Reset trackers when flat
+if pos_size == 0 and entry_side != 0
+entry_price := na
+highest_since_entry := na
+lowest_since_entry := na
+entry_side := 0
+
+// =========================
+// == ALERTS & PLOTS ======
+// =========================
+alertcondition(can_long, title="Long Signal", message="Adaptive System: Long signal on {{ticker}} - qty calc ready")
+alertcondition(can_short, title="Short Signal", message="Adaptive System: Short signal on {{ticker}} - qty calc ready")
+
+plotshape(can_long, title="LongSignal", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.tiny)
+plotshape(can_short, title="ShortSignal", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.tiny)
+plot(atr, title="ATR", style=plot.style_area)
+plot(ma_fast, title="MA Fast")
+plot(ma_slow, title="MA Slow")
+
+// End of script - Pine v6 compatible
